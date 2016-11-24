@@ -30,6 +30,34 @@ public class JedisLock {
 
     private Lock lock = null;
 
+    private String LUA_ACQUIRE_SCRIPT = "if redis.call('setnx', \"%s\", \"%s\") == 1 then\n" +
+            "            if %d ~= '' then\n" +
+            "                redis.call('pexpire', \"%s\", %d)\n" +
+            "            end\n" +
+            "            return 1\n" +
+            "        end\n" +
+            "        return 0";
+    private String LUA_RELEASE_SCRIPT = "local token = redis.call('get', \"%s\")\n" +
+            "        if not token or token ~= \"%s\" then\n" +
+            "            return 0\n" +
+            "        end\n" +
+            "        redis.call('del', \"%s\")\n" +
+            "        return 1";
+
+    private String LUA_EXTEND_SCRIPT = "local token = redis.call('get', KEYS[1])\n" +
+            "        if not token or token ~= ARGV[1] then\n" +
+            "            return 0\n" +
+            "        end\n" +
+            "        local expiration = redis.call('pttl', KEYS[1])\n" +
+            "        if not expiration then\n" +
+            "            expiration = 0\n" +
+            "        end\n" +
+            "        if expiration < 0 then\n" +
+            "            return 0\n" +
+            "        end\n" +
+            "        redis.call('pexpire', KEYS[1], expiration + ARGV[2])\n" +
+            "        return 1";
+
     protected static class Lock {
         private UUID uuid;
         private long expiryTime;
@@ -172,19 +200,16 @@ public class JedisLock {
         while (timeout >= 0) {
 
             final Lock newLock = asLock(System.currentTimeMillis() + lockExpiryInMillis);
-            if (jedis.setnx(lockKeyPath, newLock.toString()) == 1) {
+            Long result = (Long)jedis.eval(
+                    String.format(
+                            LUA_ACQUIRE_SCRIPT, lockKeyPath, newLock.toString(),
+                            lockExpiryInMillis, lockKeyPath, lockExpiryInMillis)
+            );
+
+            if (result == 1)
+            {
                 this.lock = newLock;
                 return true;
-            }
-
-            final String currentValueStr = jedis.get(lockKeyPath);
-            final Lock currentLock = Lock.fromString(currentValueStr);
-            if (currentLock.isExpiredOrMine(lockUUID)) {
-                String oldValueStr = jedis.getSet(lockKeyPath, newLock.toString());
-                if (oldValueStr != null && oldValueStr.equals(currentValueStr)) {
-                    this.lock = newLock;
-                    return true;
-                }
             }
 
             timeout -= DEFAULT_ACQUIRY_RESOLUTION_MILLIS;
@@ -196,18 +221,13 @@ public class JedisLock {
 
     /**
      * Renew lock.
-     * 
+     *
      * @return true if lock is acquired, false otherwise
      * @throws InterruptedException
      *             in case of thread interruption
      */
     public boolean renew() throws InterruptedException {
-        final Lock lock = Lock.fromString(jedis.get(lockKeyPath));
-        if (!lock.isExpiredOrMine(lockUUID)) {
-            return false;
-        }
-
-        return acquire(jedis);
+        return false;
     }
 
     /**
@@ -223,7 +243,10 @@ public class JedisLock {
      */
     protected synchronized void release(Jedis jedis) {
         if (isLocked()) {
-            jedis.del(lockKeyPath);
+
+            jedis.eval(String.format(LUA_RELEASE_SCRIPT, lockKeyPath, this.lock.toString(),
+                    lockKeyPath));
+
             this.lock = null;
         }
     }
